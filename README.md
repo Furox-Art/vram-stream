@@ -8,6 +8,8 @@ can reach it over the CPU–GPU link.
 For repeated reads, the VRAM cache transfers input blocks in advance and keeps
 recently used blocks on the GPU. A PyTorch adapter supplies cached training
 batches and a benchmark measures both CUDA memory paths.
+Optional training integrations move model state and saved activations to
+RAM using PyTorch FSDP2 or Hugging Face Trainer with DeepSpeed.
 
 ## Install
 
@@ -81,6 +83,12 @@ Queue every access to a leased address on its supplied stream within
 editing them. Each slot uses at most `block_bytes` in each memory tier.
 The source can also be a contiguous NumPy memory map.
 
+The cache selects up to `slots` blocks using 80% of the available VRAM reported
+at open time. `vram_budget_bytes` and `pinned_budget_bytes` add explicit caps.
+If an allocation runs out of memory, it releases the partial allocation and
+retries with fewer slots. Each retry uses the original block size. Inspect
+`cache.slot_count` and `cache.stats.oom_retries` for the result.
+
 ## Prefetch PyTorch training batches
 
 Use an NVIDIA CUDA build of [PyTorch](https://pytorch.org/get-started/locally/).
@@ -115,6 +123,81 @@ memory for returned batches and the training program. A training set smaller
 than the cache can remain resident across passes. A larger set can benefit
 from overlapping the next input transfer with work on the current batch.
 
+## Train with model state in RAM
+
+`offload_model` applies [FSDP2 CPU offload](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html)
+to selected layer groups. The groups move to the GPU for forward and backward
+work. The optimizer updates the CPU parameter shards and stores its state in
+RAM. Select groups small enough to fit in VRAM along with their working data.
+`offload_activations` saves the tensors needed by backward in CPU memory.
+
+The following example runs with a PyTorch build that includes FSDP2 and NCCL.
+Save it as a script and start it with `torchrun --standalone --nproc-per-node=1`.
+
+```python
+import os
+
+import torch
+from torch.distributed.device_mesh import init_device_mesh
+from vram_stream import offload_activations, offload_model, prefetch_dataloader
+
+device = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(device)
+torch.distributed.init_process_group("nccl")
+try:
+    mesh = init_device_mesh("cuda", (torch.distributed.get_world_size(),))
+    model = torch.nn.Sequential(
+        torch.nn.Sequential(torch.nn.Linear(8, 32), torch.nn.ReLU()),
+        torch.nn.Linear(32, 1),
+    )
+    model = offload_model(model, layers=model.children(), mesh=mesh)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    rows = torch.randn(64, 8)
+    dataset = torch.utils.data.TensorDataset(rows, rows.sum(dim=1, keepdim=True))
+    loader = torch.utils.data.DataLoader(dataset, batch_size=16, pin_memory=True)
+    with prefetch_dataloader(loader, device=device) as batches:
+        for features, labels in batches:
+            optimizer.zero_grad(set_to_none=True)
+            with offload_activations():
+                loss = torch.nn.functional.mse_loss(model(features), labels)
+            loss.backward()
+            optimizer.step()
+finally:
+    torch.distributed.destroy_process_group()
+```
+
+`prefetch_dataloader` also traverses nested mappings, lists and tuples.
+It transfers CPU tensors and carries metadata through to the training loop.
+Use pinned DataLoader batches and keep their source tensors stable while a
+copy is in flight. `open_torch_batches` remains available for reusable NumPy
+inputs with an explicit cache budget.
+
+## Hugging Face Trainer
+
+Install Transformers, Accelerate and a compatible DeepSpeed build for the
+[Trainer ZeRO-3 integration](https://huggingface.co/docs/transformers/deepspeed).
+Create `TrainingArguments` with the profile before loading the model so
+the DeepSpeed integration can initialize the model under ZeRO-3.
+
+```python
+from transformers import AutoModelForSequenceClassification, TrainingArguments
+from vram_stream import create_offload_trainer, zero3_cpu_offload_config
+
+def build_trainer(model_id, train_dataset):
+    args = TrainingArguments(
+        output_dir="checkpoints",
+        deepspeed=zero3_cpu_offload_config(),
+        per_device_train_batch_size=1,
+        dataloader_pin_memory=True,
+    )
+    model = AutoModelForSequenceClassification.from_pretrained(model_id)
+    return create_offload_trainer(model=model, args=args, train_dataset=train_dataset)
+```
+
+The ZeRO-3 profile offloads parameters and optimizer state. The Trainer
+wrapper stores saved activations in CPU memory for the training loss.
+`pin_activations=False` uses pageable memory for those activations.
+
 ## Measure the two CUDA paths
 
 ```bash
@@ -130,6 +213,12 @@ reports its logical workload size in the shared `logical_read_bytes` field.
 That field describes requested reads, with hardware caching and interconnect
 traffic left to GPU profiling. Results characterize this workload. Actual
 training throughput depends on the model, reuse, memory budget and device.
+
+For a real GPU check, install the checkout with its test dependencies and run
+the suite with `VRAM_STREAM_TEST_CUDA=1`. The training test compares final
+weights and losses against a GPU baseline and prints elapsed time and peak
+PyTorch VRAM allocation. `VRAM_STREAM_TEST_TRAINER=1` enables a separate
+small Trainer run when Transformers and Accelerate are available.
 
 ### Comparison with related tools
 
