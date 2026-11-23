@@ -9,7 +9,12 @@ from threading import get_ident
 
 import numpy as np
 
-from .cuda_workspace import CudaWorkspaceError, _allocate
+from .cuda_workspace import (
+    CudaOutOfMemoryError,
+    CudaWorkspaceError,
+    _device_context,
+    _regions,
+)
 from .planner import MIB, _integer
 
 _NON_BLOCKING_STREAM = 1
@@ -51,6 +56,7 @@ class CacheStats:
     reused_reads: int
     vram_bytes: int
     pinned_ram_bytes: int
+    oom_retries: int = 0
 
 
 @dataclass(slots=True)
@@ -69,7 +75,15 @@ class CudaReadCache:
     """A host-thread-bound CUDA cache created by open_cuda_cache."""
 
     def __init__(
-        self, cuda, workspace, source, block_bytes, slots, copy_stream, compute_stream
+        self,
+        cuda,
+        workspace,
+        source,
+        block_bytes,
+        slots,
+        copy_stream,
+        compute_stream,
+        retries,
     ):
         self._cuda = cuda
         self._source = source
@@ -86,6 +100,7 @@ class CudaReadCache:
         self._vram_bytes = workspace.vram_bytes
         self._pinned_bytes = workspace.ram_bytes
         self._slot_count = len(slots)
+        self._oom_retries = retries
 
     @property
     def block_count(self) -> int:
@@ -108,6 +123,7 @@ class CudaReadCache:
             self._reuses,
             self._vram_bytes,
             self._pinned_bytes,
+            self._oom_retries,
         )
 
     def _check_active(self) -> None:
@@ -205,16 +221,33 @@ class CudaReadCache:
 
 @contextmanager
 def open_cuda_cache(
-    source, *, block_bytes: int = 16 * MIB, slots: int = 2, device: int = 0
+    source,
+    *,
+    block_bytes: int = 16 * MIB,
+    slots: int = 2,
+    device: int = 0,
+    vram_budget_bytes: int | None = None,
+    pinned_budget_bytes: int | None = None,
 ) -> Iterator[CudaReadCache]:
     """Open a cache over a contiguous CPU buffer such as a NumPy array or memmap.
 
     Submit GPU reads on the stream supplied by each lease. Keep the CPU source
     stable between invalidations and finish the lease before retaining any data
     in a separate allocation.
+
+    The slot count is capped by 80 percent of free VRAM and either supplied
+    budget. Allocation failures are retried with fewer slots.
     """
     block_bytes = _integer(block_bytes, "block_bytes", 1)
     slots = _integer(slots, "slots", 1)
+    budgets = [
+        _integer(value, name, 1)
+        for name, value in (
+            ("vram_budget_bytes", vram_budget_bytes),
+            ("pinned_budget_bytes", pinned_budget_bytes),
+        )
+        if value is not None
+    ]
     try:
         data = np.frombuffer(source, dtype=np.uint8)
     except (TypeError, BufferError, ValueError) as error:
@@ -222,13 +255,32 @@ def open_cuda_cache(
     if not data.nbytes:
         raise ValueError("the CUDA cache source must contain data")
     block_bytes = min(block_bytes, data.nbytes)
-    count = min(slots, (data.nbytes + block_bytes - 1) // block_bytes)
-    allocated = count * block_bytes
+    blocks = (data.nbytes + block_bytes - 1) // block_bytes
 
-    with (
-        _allocate(allocated, allocated, device) as (cuda, workspace),
-        ExitStack() as cleanup,
-    ):
+    with _device_context(device) as (cuda, ordinal), ExitStack() as cleanup:
+        free, total = ct.c_size_t(), ct.c_size_t()
+        cuda.call("cuMemGetInfo_v2", ct.byref(free), ct.byref(total))
+        available = min([free.value * 4 // 5, *budgets])
+        count = min(slots, blocks, available // block_bytes)
+        if count < 1:
+            raise CudaOutOfMemoryError(
+                f"one {block_bytes}-byte block exceeds the {available}-byte cache budget"
+            )
+        retries = 0
+        while True:
+            allocated = count * block_bytes
+            try:
+                workspace = cleanup.enter_context(
+                    _regions(cuda, ordinal, allocated, allocated)
+                )
+            except CudaOutOfMemoryError:
+                if count == 1:
+                    raise
+                count //= 2
+                retries += 1
+            else:
+                break
+
         copy_stream = _stream(cuda, cleanup)
         compute_stream = _stream(cuda, cleanup)
         buffers = [
@@ -241,7 +293,14 @@ def open_cuda_cache(
             for index in range(count)
         ]
         cache = CudaReadCache(
-            cuda, workspace, data, block_bytes, buffers, copy_stream, compute_stream
+            cuda,
+            workspace,
+            data,
+            block_bytes,
+            buffers,
+            copy_stream,
+            compute_stream,
+            retries,
         )
         cleanup.callback(cuda.call, "cuCtxSynchronize")
         try:
