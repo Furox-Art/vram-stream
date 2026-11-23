@@ -218,7 +218,21 @@ For a real GPU check, install the checkout with its test dependencies and run
 the suite with `VRAM_STREAM_TEST_CUDA=1`. The training test compares final
 weights and losses against a GPU baseline and prints elapsed time and peak
 PyTorch VRAM allocation. `VRAM_STREAM_TEST_TRAINER=1` enables a separate
-small Trainer run when Transformers and Accelerate are available.
+comparison of two real Trainer runs using the same initial weights. The
+manual [Trainer validation](https://github.com/Furox-Art/vram-stream/actions/workflows/trainer-validation.yml)
+workflow runs this comparison on CPU with a synthetic dataset.
+
+To check the full ZeRO-3 path on an NVIDIA machine with CUDA PyTorch,
+Transformers, Accelerate and DeepSpeed installed, launch the dedicated test
+with the single-process distributed launcher.
+
+```bash
+VRAM_STREAM_TEST_DEEPSPEED=1 torchrun --standalone --nproc-per-node=1 \
+  -m pytest -q -s tests/test_training.py::test_real_deepspeed_zero3_on_cuda
+```
+
+The test checks completed optimization steps, ZeRO stage and the placement of
+the parameter and optimizer shards in CPU memory.
 
 ### Comparison with related tools
 
