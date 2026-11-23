@@ -24,6 +24,14 @@ _CUDA_ARGUMENTS = {
     "cuCtxPushCurrent_v2": (c_void_p,),
     "cuCtxPopCurrent_v2": (POINTER(c_void_p),),
     "cuCtxSynchronize": (),
+    "cuStreamCreate": (POINTER(c_void_p), c_uint),
+    "cuStreamDestroy_v2": (c_void_p,),
+    "cuStreamSynchronize": (c_void_p,),
+    "cuStreamWaitEvent": (c_void_p, c_void_p, c_uint),
+    "cuEventCreate": (POINTER(c_void_p), c_uint),
+    "cuEventDestroy_v2": (c_void_p,),
+    "cuEventRecord": (c_void_p, c_void_p),
+    "cuEventSynchronize": (c_void_p,),
     "cuMemAlloc_v2": (POINTER(_DEVICE_PTR), c_size_t),
     "cuMemFree_v2": (_DEVICE_PTR,),
     "cuMemHostAlloc": (POINTER(c_void_p), c_size_t, c_uint),
@@ -47,6 +55,7 @@ _CUDA_ARGUMENTS = {
         POINTER(c_void_p),
     ),
     "cuMemcpyDtoH_v2": (c_void_p, _DEVICE_PTR, c_size_t),
+    "cuMemcpyHtoDAsync_v2": (_DEVICE_PTR, c_void_p, c_size_t, c_void_p),
 }
 
 

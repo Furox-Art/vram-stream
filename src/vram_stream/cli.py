@@ -13,6 +13,7 @@ from tempfile import TemporaryDirectory
 import numpy as np
 from numpy.lib.format import open_memmap, write_array_header_2_0
 
+from .cuda_benchmark import benchmark_cuda_cache
 from .cuda_workspace import verify_cuda_workspace
 from .engine import _cuda_device, matmul
 from .planner import DEFAULT_BUDGET_BYTES, MIB, TilePlan, plan_matmul
@@ -137,6 +138,22 @@ def _parser() -> argparse.ArgumentParser:
     memory.add_argument(
         "--ram-mib", type=int, default=16, help="System RAM to map in MiB."
     )
+    benchmark = commands.add_parser(
+        "benchmark", help="Compare direct RAM reads and staged VRAM on the same input."
+    )
+    benchmark.add_argument(
+        "--block-mib", type=int, default=16, help="Input block size in MiB."
+    )
+    benchmark.add_argument(
+        "--blocks", type=int, default=2, help="Number of input blocks."
+    )
+    benchmark.add_argument(
+        "--slots", type=int, default=2, help="Maximum number of cache slots."
+    )
+    benchmark.add_argument(
+        "--passes", type=int, default=4, help="Number of passes over the input."
+    )
+    benchmark.add_argument("--device", type=int, default=0, help="CUDA device index.")
     commands.add_parser(
         "info", help="Show the devices available for matrix multiplication."
     )
@@ -180,6 +197,14 @@ def main(argv: list[str] | None = None) -> int:
                 ram_bytes=args.ram_mib * MIB,
                 device=args.device,
             )
+        elif args.command == "benchmark":
+            report = benchmark_cuda_cache(
+                block_bytes=args.block_mib * MIB,
+                blocks=args.blocks,
+                slots=args.slots,
+                passes=args.passes,
+                device=args.device,
+            )
         elif args.command == "info":
             report = _device_report()
         elif args.command == "plan":
@@ -193,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             report = _run_product(args)
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
+    except (MemoryError, OSError, RuntimeError, TypeError, ValueError) as error:
         print(f"vram-stream: {error}", file=sys.stderr)
         return 1
     print(json.dumps(report, indent=2))

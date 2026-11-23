@@ -1,0 +1,41 @@
+.version 6.0
+.target sm_52
+.address_size 64
+
+.visible .entry add_words(
+    .param .u64 input_address,
+    .param .u64 output_address,
+    .param .u64 word_count
+)
+{
+    .reg .pred %done;
+    .reg .b32 %lane, %block, %block_size, %grid, %first, %stride, %input, %output;
+    .reg .b64 %src, %dst, %count, %index, %step, %offset, %input_word, %output_word;
+
+    ld.param.u64 %src, [input_address];
+    ld.param.u64 %dst, [output_address];
+    ld.param.u64 %count, [word_count];
+    mov.u32 %lane, %tid.x;
+    mov.u32 %block, %ctaid.x;
+    mov.u32 %block_size, %ntid.x;
+    mov.u32 %grid, %nctaid.x;
+    mad.lo.u32 %first, %block, %block_size, %lane;
+    mul.lo.u32 %stride, %grid, %block_size;
+    cvt.u64.u32 %index, %first;
+    cvt.u64.u32 %step, %stride;
+
+LOOP:
+    setp.ge.u64 %done, %index, %count;
+    @%done bra FINISH;
+    shl.b64 %offset, %index, 2;
+    add.u64 %input_word, %src, %offset;
+    add.u64 %output_word, %dst, %offset;
+    ld.global.u32 %input, [%input_word];
+    ld.global.u32 %output, [%output_word];
+    add.u32 %output, %input, %output;
+    st.global.u32 [%output_word], %output;
+    add.u64 %index, %index, %step;
+    bra LOOP;
+FINISH:
+    ret;
+}

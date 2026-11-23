@@ -5,6 +5,10 @@ Both regions are addressable by the same CUDA kernel. The system-RAM region
 is pinned and mapped into the GPU's address space so kernel loads and stores
 can reach it over the CPU–GPU link.
 
+For repeated reads, the VRAM cache transfers input blocks in advance and keeps
+recently used blocks on the GPU. A PyTorch adapter supplies cached training
+batches and a benchmark measures both CUDA memory paths.
+
 ## Install
 
 Use 64-bit Python 3.11 or later on Linux or Windows. The memory workspace
@@ -51,6 +55,89 @@ Mapped RAM traffic crosses PCIe or NVLink, with the bandwidth and latency
 of that connection. The driver and operating system limit how much RAM can
 be pinned. [NVIDIA's mapped memory documentation](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html#mapped-memory)
 describes the access and synchronization rules.
+
+## Cache read-mostly data in VRAM
+
+`open_cuda_cache` reads a C-contiguous buffer in fixed-size blocks. It
+allocates one pinned RAM buffer and one VRAM buffer per slot. Copies and
+kernels run in separate CUDA streams. CUDA events protect the pinned buffer
+until its copy completes and the VRAM buffer until its last consumer finishes.
+Blocks are evicted in least-recently-used order when space is needed.
+
+```python
+import numpy as np
+from vram_stream import open_cuda_cache
+
+source = np.arange(262144, dtype=np.float32)
+with open_cuda_cache(source, block_bytes=256 * 1024, slots=2) as cache:
+    with cache.read(0) as block:
+        # Queue your kernel with block.device_pointer on block.stream.
+        cache.prefetch(1)
+    print(cache.stats)
+```
+
+Queue every access to a leased address on its supplied stream within
+`cache.read()`. Keep source values stable or call `cache.invalidate()` before
+editing them. Each slot uses at most `block_bytes` in each memory tier.
+The source can also be a contiguous NumPy memory map.
+
+## Prefetch PyTorch training batches
+
+Use an NVIDIA CUDA build of [PyTorch](https://pytorch.org/get-started/locally/).
+`open_torch_batches` feeds a dense, contiguous NumPy dataset in row order,
+including the final partial batch. The cache can be reused across epochs.
+Its adapter uses a device-to-device copy to give PyTorch ownership of each
+returned batch. Training parameters, activations and optimizer state follow
+the placement configured by the training program.
+
+```python
+import numpy as np
+import torch
+from vram_stream import open_torch_batches
+
+features = np.random.default_rng(0).normal(size=(256, 8)).astype(np.float32)
+dataset = np.column_stack((features, features.sum(axis=1)))
+model = torch.nn.Linear(8, 1).cuda()
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+with open_torch_batches(dataset, batch_rows=64, slots=2) as batches:
+    for _ in range(2):
+        for batch in batches:
+            optimizer.zero_grad()
+            loss = torch.nn.functional.mse_loss(model(batch[:, :-1]), batch[:, -1:])
+            loss.backward()
+            optimizer.step()
+    print(batches.stats)
+```
+
+The two-tier cache budget covers its slots. PyTorch separately allocates
+memory for returned batches and the training program. A training set smaller
+than the cache can remain resident across passes. A larger set can benefit
+from overlapping the next input transfer with work on the current batch.
+
+## Measure the two CUDA paths
+
+```bash
+vram-stream benchmark --block-mib 16 --blocks 2 --slots 2 --passes 4
+```
+
+Both paths launch the same accumulation kernel on the same data. The tool
+compares every output word with NumPy. It reports elapsed wall time through
+GPU completion, bytes submitted for CPU-to-GPU copies, reused reads and
+buffer sizes. The timer includes cache uploads and excludes initialization,
+kernel warm-up and result readback. The direct path reads mapped RAM and
+reports its logical workload size in the shared `logical_read_bytes` field.
+That field describes requested reads, with hardware caching and interconnect
+traffic left to GPU profiling. Results characterize this workload. Actual
+training throughput depends on the model, reuse, memory budget and device.
+
+### Comparison with related tools
+
+| Tool | Documented scope or constraint | Choice in vram-stream |
+| --- | --- | --- |
+| DeepSpeed ZeRO | Parameter offload is a ZeRO stage 3 feature. Pinned parameter storage can encounter host memory-lock limits. [DeepSpeed configuration](https://www.deepspeed.ai/docs/config-json/#parameter-offloading) | Allocate a fixed number of pinned slots and provide CUDA access independently of a distributed training configuration. |
+| PyTorch FSDP CPU offload | FSDP's CPU-offload path documents a gradient-accumulation constraint outside `no_sync()`. [FSDP limitations](https://docs.pytorch.org/docs/stable/fsdp.html#limitations) | Keep the adapter at the training input boundary and leave gradient accumulation to the training loop. |
+| Hugging Face Accelerate Big Model Inference | Its CPU and disk weight-offload path documents bringing in weights as they are needed. [Big Model Inference limits](https://huggingface.co/docs/accelerate/main/en/concept_guides/big_model_inference#limits-and-further-development) | Let the caller prefetch the next block and reuse resident data within a fixed VRAM budget. |
 
 ## Blocked matrix multiplication
 
