@@ -82,7 +82,13 @@ class TorchBatchSource:
 
 @contextmanager
 def open_torch_batches(
-    source: np.ndarray, *, batch_rows: int, slots: int = 2, device: int = 0
+    source: np.ndarray,
+    *,
+    batch_rows: int,
+    slots: int = 2,
+    device: int = 0,
+    vram_budget_bytes: int | None = None,
+    pinned_budget_bytes: int | None = None,
 ) -> Iterator[TorchBatchSource]:
     """Yield an iterable of owned CUDA tensors from a NumPy dataset.
 
@@ -107,6 +113,11 @@ def open_torch_batches(
         )
     row_bytes = source.nbytes // len(source)
     with open_cuda_cache(
-        source, block_bytes=batch_rows * row_bytes, slots=slots, device=device
+        source,
+        block_bytes=batch_rows * row_bytes,
+        slots=slots,
+        device=device,
+        vram_budget_bytes=vram_budget_bytes,
+        pinned_budget_bytes=pinned_budget_bytes,
     ) as cache:
         yield TorchBatchSource(torch, cache, torch.device(f"cuda:{device}"), source)
