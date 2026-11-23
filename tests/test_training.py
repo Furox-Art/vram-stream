@@ -91,6 +91,19 @@ def test_fsdp_wraps_children_before_root(monkeypatch):
         True,
         True,
     ]
+    calls.clear()
+    with pytest.raises(ValueError, match="resident_layers"):
+        offload_model(model, layers=(group,), resident_layers=(child,))
+    assert not calls
+    offload_model(
+        model,
+        layers=(group, child),
+        resident_layers=(child,),
+        keep_forward_layers=(child,),
+    )
+    assert calls[0] == (child, {"mesh": None, "reshard_after_forward": False})
+    assert [module for module, _ in calls] == [child, group, model]
+    assert all(options["offload_policy"] == ("cpu", True) for _, options in calls[1:])
 
 
 def test_trainer_enters_activation_scope_only_in_training(monkeypatch):
@@ -238,16 +251,23 @@ def test_training_offload_on_cuda_hardware(tmp_path):
     del baseline, reference_optimizer
     torch.cuda.empty_cache()
 
-    def train_offloaded(mesh, *, keep_last):
+    def train_offloaded(mesh, *, keep_last, resident_last=0):
         network = deepcopy(model)
         layers = list(network.children())
-        kept = layers[len(layers) - keep_last:]
-        offload_model(network, layers=layers, keep_forward_layers=kept, mesh=mesh)
+        kept = layers[len(layers) - keep_last :]
+        resident = layers[len(layers) - resident_last :]
+        offload_model(
+            network,
+            layers=layers,
+            keep_forward_layers=kept,
+            resident_layers=resident,
+            mesh=mesh,
+        )
 
         def check_forward():
             for layer in layers:
                 parameter = next(layer.parameters())
-                if layer in kept:
+                if layer in kept or layer in resident:
                     assert parameter.device.type == "cuda"
                 else:
                     assert parameter.to_local().device.type == "cpu"
@@ -256,14 +276,23 @@ def test_training_offload_on_cuda_hardware(tmp_path):
             network, activation_offload=True, check_forward=check_forward
         )
         torch.testing.assert_close(loss, reference_loss, rtol=1e-4, atol=1e-5)
-        for actual, expected in zip(network.parameters(), reference_weights, strict=True):
-            assert actual.to_local().device.type == "cpu"
-            assert actual.grad.to_local().device.type == "cpu"
+        placed_parameters = (
+            (parameter, "cuda" if layer in resident else "cpu")
+            for layer in layers
+            for parameter in layer.parameters()
+        )
+        for (actual, device), expected in zip(
+            placed_parameters, reference_weights, strict=True
+        ):
+            local = actual.to_local()
+            assert local.device.type == device
+            assert actual.grad.to_local().device.type == device
+            state = optimizer.state[actual]
+            assert state["exp_avg"].to_local().device.type == device
+            assert state["exp_avg_sq"].to_local().device.type == device
             torch.testing.assert_close(
-                actual.to_local(), expected, rtol=1e-4, atol=2e-6
+                local.cpu(), expected, rtol=1e-4, atol=2e-6
             )
-        for state in optimizer.state.values():
-            assert state["exp_avg"].to_local().device.type == "cpu"
         return stats
 
     torch.distributed.init_process_group(
@@ -277,6 +306,8 @@ def test_training_offload_on_cuda_hardware(tmp_path):
         offload_stats = train_offloaded(mesh, keep_last=0)
         torch.cuda.empty_cache()
         retained_stats = train_offloaded(mesh, keep_last=2)
+        torch.cuda.empty_cache()
+        mixed_stats = train_offloaded(mesh, keep_last=2, resident_last=2)
         print(
             json.dumps(
                 {
@@ -286,6 +317,7 @@ def test_training_offload_on_cuda_hardware(tmp_path):
                     "baseline": reference_stats,
                     "cpu_offload": offload_stats,
                     "cpu_offload_keep_last_two": retained_stats,
+                    "two_gpu_resident_groups": mixed_stats,
                     "matching_training": True,
                 }
             )
