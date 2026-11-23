@@ -19,8 +19,15 @@ def offload_activations(*, pin_memory: bool = True):
     return _pytorch().autograd.graph.save_on_cpu(pin_memory=pin_memory)
 
 
-def offload_model(model, *, layers=(), mesh=None, pin_memory: bool = True):
+def offload_model(
+    model, *, layers=(), keep_forward_layers=(), mesh=None, pin_memory: bool = True
+):
     """Apply FSDP2 CPU offload to a model and its selected layer groups in place.
+
+    Choose a subset of ``layers`` with ``keep_forward_layers`` to keep their
+    gathered parameters in VRAM between forward and backward. This avoids
+    gathering them again during backward and uses more VRAM when they are held.
+    Parameter shards and optimizer state still live in CPU memory.
 
     Initialize torch.distributed before calling this function. Create the
     optimizer from the wrapped model's parameters after this call.
@@ -49,16 +56,21 @@ def offload_model(model, *, layers=(), mesh=None, pin_memory: bool = True):
         or not identities <= positions.keys()
     ):
         raise ValueError("layers must contain distinct submodules of model")
+    kept = {id(layer) for layer in keep_forward_layers}
+    if not kept <= identities:
+        raise ValueError("keep_forward_layers must be a subset of layers")
 
-    kwargs = {
-        "mesh": mesh,
-        "offload_policy": offload_policy,
-        "reshard_after_forward": True,
-    }
     # FSDP2 wraps child groups before their parents.
     for layer in sorted(selected, key=lambda value: positions[id(value)], reverse=True):
-        fully_shard(layer, **kwargs)
-    return fully_shard(model, **kwargs)
+        fully_shard(
+            layer,
+            mesh=mesh,
+            offload_policy=offload_policy,
+            reshard_after_forward=id(layer) not in kept,
+        )
+    return fully_shard(
+        model, mesh=mesh, offload_policy=offload_policy, reshard_after_forward=True
+    )
 
 
 def zero3_cpu_offload_config(
