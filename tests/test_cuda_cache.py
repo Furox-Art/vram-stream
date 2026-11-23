@@ -47,6 +47,9 @@ def _value(handle):
 class _AsyncDriver(SimulatedDriver):
     """Defer DMA and kernel work until the relevant CUDA event completes."""
 
+    free_bytes = 2**30
+    pinned_limit = 2**30
+
     def __init__(self):
         super().__init__()
         self.handles = count(1)
@@ -62,6 +65,17 @@ class _AsyncDriver(SimulatedDriver):
 
     def cuMemFree_v2(self, pointer):
         del self.allocations[_value(pointer)]
+
+    def cuMemGetInfo_v2(self, free, total):
+        _set_pointer(free, ct.c_size_t, self.free_bytes)
+        _set_pointer(total, ct.c_size_t, 2**30)
+
+    def cuMemHostAlloc(self, output, size, flags):
+        if size > self.pinned_limit:
+            raise cuda_workspace.CudaOutOfMemoryError(
+                "simulated pinned allocation failure"
+            )
+        super().cuMemHostAlloc(output, size, flags)
 
     def cuStreamCreate(self, output, flags):
         assert flags == 1
@@ -229,6 +243,39 @@ def test_closed_cache_releases_source_buffer(async_drivers):
     del source
     assert lifetime() is None
     assert cache.block_count == 1
+
+
+def test_cache_caps_slots_by_free_vram_and_pinned_budget(async_drivers, monkeypatch):
+    monkeypatch.setattr(_AsyncDriver, "free_bytes", 100)
+    data = np.arange(256, dtype=np.uint8)
+    with open_cuda_cache(
+        data, block_bytes=16, slots=10, pinned_budget_bytes=64
+    ) as cache:
+        assert cache.slot_count == 4
+        assert cache.stats.vram_bytes == 64
+        assert cache.block_count == 16
+    with open_cuda_cache(data, block_bytes=16, slots=10) as cache:
+        assert cache.slot_count == 5
+    with (
+        pytest.raises(cuda_workspace.CudaOutOfMemoryError, match="cache budget"),
+        open_cuda_cache(data, block_bytes=128),
+    ):
+        pytest.fail("the requested block exceeds free VRAM")
+
+
+def test_retries_release_partial_allocation_and_keep_block_size(
+    async_drivers, monkeypatch
+):
+    monkeypatch.setattr(_AsyncDriver, "pinned_limit", 16)
+    with open_cuda_cache(bytes(range(64)), block_bytes=16, slots=4) as cache:
+        driver = async_drivers[0]
+        assert len(driver.allocations) == 1
+        assert cache.stats.oom_retries == 2
+        assert cache.stats.pinned_ram_bytes == 16
+        assert cache.block_count == 4
+        with cache.read(1) as block:
+            assert block.size_bytes == 16
+    assert not driver.allocations
 
 
 @pytest.mark.parametrize(("slots", "copied", "reused"), [(1, 384, 0), (2, 128, 4)])
