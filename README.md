@@ -187,6 +187,24 @@ Apply this to the unwrapped model before creating the optimizer. If you run
 a forward pass without backward, call `reshard()` on each retained group
 to free its gathered parameters.
 
+Use `resident_layers` to keep selected FSDP2 groups' parameter shards,
+gradients and optimizer state on the GPU. The other groups use CPU offload.
+This reduces per-step transfers and moves those groups' optimizer updates to
+the GPU. Each FSDP2 group has its own placement, including groups wrapped
+inside another selected group.
+
+```python
+layers = list(model.children())
+model = offload_model(model, layers=layers, resident_layers=layers[-2:], mesh=mesh)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, foreach=False)
+```
+
+Set the resident groups based on the VRAM available for parameters,
+gradients and optimizer state after allowing room for activations and FSDP2
+buffers. Mixed placement requires an optimizer that supports both CPU and
+GPU tensors. Use `keep_forward_layers` as well to retain gathered parameters
+between forward and backward for groups with room in VRAM.
+
 ## Hugging Face Trainer
 
 Install Transformers, Accelerate and a compatible DeepSpeed build for the
@@ -232,8 +250,9 @@ training throughput depends on the model, reuse, memory budget and device.
 For a real GPU check, install the checkout with its test dependencies and run
 the suite with `VRAM_STREAM_TEST_CUDA=1`. After warm-up, the training test
 measures step time and peak PyTorch VRAM for a GPU baseline, CPU offload,
-and CPU offload with the last two layer groups retained between forward and
-backward. It checks losses, final weights and parameter placement.
+CPU offload with gathered parameters retained, and a mix of CPU-offloaded
+and GPU-resident groups. It checks losses, final weights and the placement
+of parameter shards, gradients and optimizer state.
 `VRAM_STREAM_TEST_TRAINER=1` enables a separate
 comparison of two real Trainer runs using the same initial weights. The
 manual [Trainer validation](https://github.com/Furox-Art/vram-stream/actions/workflows/trainer-validation.yml)
