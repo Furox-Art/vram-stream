@@ -34,6 +34,7 @@ _CUDA_ARGUMENTS = {
     "cuEventSynchronize": (c_void_p,),
     "cuMemAlloc_v2": (POINTER(_DEVICE_PTR), c_size_t),
     "cuMemFree_v2": (_DEVICE_PTR,),
+    "cuMemGetInfo_v2": (POINTER(c_size_t), POINTER(c_size_t)),
     "cuMemHostAlloc": (POINTER(c_void_p), c_size_t, c_uint),
     "cuMemHostGetDevicePointer_v2": (POINTER(_DEVICE_PTR), c_void_p, c_uint),
     "cuMemFreeHost": (c_void_p,),
@@ -61,6 +62,10 @@ _CUDA_ARGUMENTS = {
 
 class CudaWorkspaceError(RuntimeError):
     """The CUDA driver could not create or verify the memory workspace."""
+
+
+class CudaOutOfMemoryError(CudaWorkspaceError):
+    """The CUDA driver could not reserve the requested memory."""
 
 
 class _CudaDriver:
@@ -100,7 +105,8 @@ class _CudaDriver:
                 if message.value
                 else "unknown CUDA error"
             )
-            raise CudaWorkspaceError(f"{name} failed ({status}): {detail}")
+            error_type = CudaOutOfMemoryError if status == 2 else CudaWorkspaceError
+            raise error_type(f"{name} failed ({status}): {detail}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,21 +126,16 @@ class CudaWorkspace:
         return self.vram_bytes + self.ram_bytes
 
 
-@contextmanager
-def _allocate(
-    vram_bytes: int, ram_bytes: int, device: int
-) -> Iterator[tuple[_CudaDriver, CudaWorkspace]]:
-    vram_bytes = _integer(vram_bytes, "vram_bytes", 1)
-    ram_bytes = _integer(ram_bytes, "ram_bytes", 1)
-    device = _integer(device, "device", 0)
-    for name, value, maximum in (
-        ("vram_bytes", vram_bytes, sys.maxsize),
-        ("ram_bytes", ram_bytes, sys.maxsize),
-        ("device", device, 2**31 - 1),
-    ):
-        if value > maximum:
-            raise ValueError(f"{name} must be at most {maximum}")
+def _bounded(value: int, name: str, minimum: int, maximum: int) -> int:
+    value = _integer(value, name, minimum)
+    if value > maximum:
+        raise ValueError(f"{name} must be at most {maximum}")
+    return value
 
+
+@contextmanager
+def _device_context(device: int) -> Iterator[tuple[_CudaDriver, int]]:
+    device = _bounded(device, "device", 0, 2**31 - 1)
     cuda = _CudaDriver()
     cuda.call("cuInit", 0)
     selected = c_int()
@@ -150,7 +151,16 @@ def _allocate(
         cleanup.callback(cuda.call, "cuDevicePrimaryCtxRelease_v2", selected)
         cuda.call("cuCtxPushCurrent_v2", context)
         cleanup.callback(cuda.call, "cuCtxPopCurrent_v2", ct.byref(c_void_p()))
+        yield cuda, device
 
+
+@contextmanager
+def _regions(
+    cuda, device: int, vram_bytes: int, ram_bytes: int
+) -> Iterator[CudaWorkspace]:
+    vram_bytes = _bounded(vram_bytes, "vram_bytes", 1, sys.maxsize)
+    ram_bytes = _bounded(ram_bytes, "ram_bytes", 1, sys.maxsize)
+    with ExitStack() as cleanup:
         vram = _DEVICE_PTR()
         cuda.call("cuMemAlloc_v2", ct.byref(vram), vram_bytes)
         cleanup.callback(cuda.call, "cuMemFree_v2", vram)
@@ -160,14 +170,24 @@ def _allocate(
         mapped_ram = _DEVICE_PTR()
         cuda.call("cuMemHostGetDevicePointer_v2", ct.byref(mapped_ram), host, 0)
 
-        # Complete kernels before releasing either region and restore the caller's context.
+        # Finish device work before releasing either region.
         cleanup.callback(cuda.call, "cuCtxSynchronize")
-        yield (
-            cuda,
-            CudaWorkspace(
-                device, vram_bytes, ram_bytes, vram.value, mapped_ram.value, host.value
-            ),
+        yield CudaWorkspace(
+            device, vram_bytes, ram_bytes, vram.value, mapped_ram.value, host.value
         )
+
+
+@contextmanager
+def _allocate(
+    vram_bytes: int, ram_bytes: int, device: int
+) -> Iterator[tuple[_CudaDriver, CudaWorkspace]]:
+    vram_bytes = _bounded(vram_bytes, "vram_bytes", 1, sys.maxsize)
+    ram_bytes = _bounded(ram_bytes, "ram_bytes", 1, sys.maxsize)
+    with (
+        _device_context(device) as (cuda, ordinal),
+        _regions(cuda, ordinal, vram_bytes, ram_bytes) as workspace,
+    ):
+        yield cuda, workspace
 
 
 @contextmanager
