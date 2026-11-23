@@ -1,4 +1,4 @@
-"""Command line interface for planning and running blocked matrix products."""
+"""Command line interface for CUDA workspaces and matrix products."""
 
 import argparse
 import json
@@ -13,6 +13,7 @@ from tempfile import TemporaryDirectory
 import numpy as np
 from numpy.lib.format import open_memmap, write_array_header_2_0
 
+from .cuda_workspace import verify_cuda_workspace
 from .engine import _cuda_device, matmul
 from .planner import DEFAULT_BUDGET_BYTES, MIB, TilePlan, plan_matmul
 
@@ -123,10 +124,22 @@ def _device_report() -> dict:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vram-stream",
-        description="Multiply host-backed matrices in memory-budgeted CPU or GPU tiles.",
+        description="Use GPU VRAM and mapped system RAM from the same CUDA context.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("info", help="Show the available computation devices.")
+    memory = commands.add_parser(
+        "memory", help="Open VRAM and mapped RAM and verify GPU access to both."
+    )
+    memory.add_argument("--device", type=int, default=0, help="CUDA device index.")
+    memory.add_argument(
+        "--vram-mib", type=int, default=16, help="VRAM to allocate in MiB."
+    )
+    memory.add_argument(
+        "--ram-mib", type=int, default=16, help="System RAM to map in MiB."
+    )
+    commands.add_parser(
+        "info", help="Show the devices available for matrix multiplication."
+    )
     plan = commands.add_parser(
         "plan", help="Estimate device buffers without loading any data."
     )
@@ -161,7 +174,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        if args.command == "info":
+        if args.command == "memory":
+            report = verify_cuda_workspace(
+                vram_bytes=args.vram_mib * MIB,
+                ram_bytes=args.ram_mib * MIB,
+                device=args.device,
+            )
+        elif args.command == "info":
             report = _device_report()
         elif args.command == "plan":
             report = _plan_report(

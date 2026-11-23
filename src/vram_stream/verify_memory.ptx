@@ -1,0 +1,31 @@
+.version 6.0
+.target sm_52
+.address_size 64
+
+.visible .entry verify_memory(
+    .param .u64 vram_first,
+    .param .u64 ram_first,
+    .param .u64 vram_last,
+    .param .u64 ram_last
+)
+{
+    .reg .pred %first;
+    .reg .b32 %lane, %vram_word, %ram_word, %sum, %xor;
+    .reg .b64 %vram, %ram;
+
+    mov.u32 %lane, %tid.x;
+    setp.eq.u32 %first, %lane, 0;
+    @%first ld.param.u64 %vram, [vram_first];
+    @%first ld.param.u64 %ram, [ram_first];
+    @!%first ld.param.u64 %vram, [vram_last];
+    @!%first ld.param.u64 %ram, [ram_last];
+
+    // Each thread reads and updates a different word in both regions.
+    ld.global.u32 %vram_word, [%vram];
+    ld.global.u32 %ram_word, [%ram];
+    add.u32 %sum, %vram_word, %ram_word;
+    xor.b32 %xor, %vram_word, %ram_word;
+    st.global.u32 [%ram], %sum;
+    st.global.u32 [%vram], %xor;
+    ret;
+}

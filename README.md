@@ -1,12 +1,14 @@
 # vram-stream
 
-Multiply large NumPy matrices using system RAM and a bounded set of GPU
-buffers. The inputs and result stay in host arrays or memory-mapped `.npy`
-files. The GPU reads and multiplies tiles that fit the configured VRAM budget.
+Open a CUDA workspace with a device-memory region and a system-RAM region.
+Both regions are addressable by the same CUDA kernel. The system-RAM region
+is pinned and mapped into the GPU's address space so kernel loads and stores
+can reach it over the CPU–GPU link.
 
 ## Install
 
-Use Python 3.11 or later.
+Use 64-bit Python 3.11 or later on Linux or Windows. The memory workspace
+requires an NVIDIA driver and a CUDA device with mapped host memory support.
 
 ```bash
 git clone https://github.com/Furox-Art/vram-stream.git
@@ -14,12 +16,49 @@ cd vram-stream
 python -m pip install .
 ```
 
-For GPU execution, install the [PyTorch build](https://pytorch.org/get-started/locally/)
-for your CUDA or ROCm setup. The default `auto` device uses an available GPU or
-falls back to NumPy on the CPU. Select a specific GPU with `--device cuda:0`.
-PyTorch uses the same `cuda` device names for ROCm.
+## Verify the memory connection
 
-## Command line
+```bash
+vram-stream memory --device 0 --vram-mib 16 --ram-mib 16
+```
+
+The command allocates both regions in the selected CUDA context. It writes
+initial values and launches one GPU kernel that combines values from VRAM
+and system RAM and writes results back to both. After synchronization it
+checks the results and reports each region's size and their total size.
+The check covers the first and last aligned 32-bit words of each region.
+The CUDA driver compiles the bundled PTX kernel when the command runs.
+
+## Use the workspace from Python
+
+```python
+from vram_stream import open_cuda_workspace
+
+with open_cuda_workspace(vram_bytes=16 * 2**20, ram_bytes=16 * 2**20) as memory:
+    vram_address = memory.vram_device_pointer
+    ram_address = memory.ram_device_pointer
+    # Pass both addresses and their lengths to a kernel in the current context.
+    print(memory.gpu_accessible_bytes)
+```
+
+Each region has its own device address. Use the selected CUDA context on
+the thread that opened the workspace. The CPU can access the mapped RAM
+through `ram_host_pointer`. Synchronize the CUDA stream before touching that
+RAM on the CPU. Both regions are released on exit and the calling thread's
+previous CUDA context is restored.
+
+Mapped RAM traffic crosses PCIe or NVLink, with the bandwidth and latency
+of that connection. The driver and operating system limit how much RAM can
+be pinned. [NVIDIA's mapped memory documentation](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html#mapped-memory)
+describes the access and synchronization rules.
+
+## Blocked matrix multiplication
+
+The matrix commands multiply host arrays or memory-mapped `.npy` files in
+bounded tiles. To run them on a GPU, install the [PyTorch build](https://pytorch.org/get-started/locally/)
+for your CUDA or ROCm setup. The default `auto` device selects an available GPU
+or falls back to NumPy on the CPU. `--device cuda:0` selects a specific GPU,
+including when using PyTorch on ROCm.
 
 ```bash
 vram-stream info
@@ -44,7 +83,7 @@ report with the device, tile plan, elapsed compute time and GPU memory retries.
 Use `--overwrite` to replace an existing result. Creating a new result without
 that option requires the output filesystem to support hard links.
 
-## Python
+### Python matrix API
 
 ```python
 import numpy as np
@@ -63,7 +102,7 @@ The inputs must be two-dimensional arrays with the same native-endian
 or memory map as `out` to provide the destination. An exception can leave a
 partially written `out` array.
 
-## Memory and performance
+### Matrix buffer sizing
 
 For tile dimensions `r`, `k` and `c`, the GPU buffers use
 `(r*k + k*c + r*c) * dtype.itemsize` bytes. The runtime uses at most 80%

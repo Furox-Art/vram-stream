@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vram-stream"
-version = "0.1.0"
-description = "Memory-budgeted matrix multiplication across system RAM and GPU VRAM"
+version = "0.2.0"
+description = "Use system RAM and GPU VRAM from the same CUDA kernel"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -23,6 +23,9 @@ Repository = "https://github.com/Furox-Art/vram-stream"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+vram_stream = ["*.ptx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
