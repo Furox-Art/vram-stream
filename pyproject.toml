@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vram-stream"
+version = "0.1.0"
+description = "Memory-budgeted matrix multiplication across system RAM and GPU VRAM"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+vram-stream = "vram_stream.cli:main"
+
+[project.urls]
+Repository = "https://github.com/Furox-Art/vram-stream"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
