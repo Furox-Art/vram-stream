@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import sys
 from contextlib import contextmanager, nullcontext
@@ -255,15 +256,7 @@ def test_training_offload_on_cuda_hardware(tmp_path):
         torch.distributed.destroy_process_group()
 
 
-@pytest.mark.skipif(
-    os.environ.get("VRAM_STREAM_TEST_TRAINER") != "1",
-    reason="set VRAM_STREAM_TEST_TRAINER=1 to exercise installed Trainer dependencies",
-)
-def test_real_hugging_face_trainer(tmp_path):
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("accelerate")
-    from transformers import TrainingArguments
-
+def _tiny_trainer_inputs(torch):
     class TinyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -280,19 +273,114 @@ def test_real_hugging_face_trainer(tmp_path):
         {"features": torch.ones(2) * number, "labels": torch.ones(1) * number}
         for number in range(8)
     ]
-    args = TrainingArguments(
-        output_dir=str(tmp_path / "trainer"),
-        max_steps=2,
-        report_to=[],
-        per_device_train_batch_size=2,
-        save_strategy="no",
-        disable_tqdm=True,
+    return TinyModel(), dataset
+
+
+@pytest.mark.skipif(
+    os.environ.get("VRAM_STREAM_TEST_TRAINER") != "1",
+    reason="set VRAM_STREAM_TEST_TRAINER=1 to exercise installed Trainer dependencies",
+)
+def test_real_hugging_face_trainer(tmp_path):
+    import torch
+    from transformers import Trainer, TrainingArguments
+
+    def arguments(name):
+        return TrainingArguments(
+            output_dir=str(tmp_path / name),
+            max_steps=2,
+            report_to=[],
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=2,
+            dataloader_pin_memory=torch.cuda.is_available(),
+            save_strategy="no",
+            disable_tqdm=True,
+            seed=7,
+        )
+
+    torch.manual_seed(7)
+    initial, dataset = _tiny_trainer_inputs(torch)
+    baseline = Trainer(
+        model=deepcopy(initial), args=arguments("baseline"), train_dataset=dataset
     )
     trainer = create_offload_trainer(
-        model=TinyModel(),
-        args=args,
+        model=deepcopy(initial),
+        args=arguments("offload"),
         train_dataset=dataset,
         pin_activations=torch.cuda.is_available(),
     )
-    trainer.train()
+    expected = baseline.train()
+    actual = trainer.train()
     assert trainer.state.global_step == 2
+    assert math.isfinite(actual.training_loss)
+    assert actual.training_loss == pytest.approx(expected.training_loss)
+    for reference, updated in zip(
+        baseline.model.parameters(), trainer.model.parameters(), strict=True
+    ):
+        torch.testing.assert_close(reference, updated)
+    assert any(
+        not torch.equal(first.detach().cpu(), updated.detach().cpu())
+        for first, updated in zip(
+            initial.parameters(), trainer.model.parameters(), strict=True
+        )
+    )
+    print(
+        json.dumps(
+            {
+                "device": str(trainer.args.device),
+                "steps": actual.global_step,
+                "trainer_loss": actual.training_loss,
+                "matching_weights": True,
+            }
+        )
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("VRAM_STREAM_TEST_DEEPSPEED") != "1",
+    reason="set VRAM_STREAM_TEST_DEEPSPEED=1 and launch with torchrun for a CUDA ZeRO-3 check",
+)
+def test_real_deepspeed_zero3_on_cuda(tmp_path):
+    import torch
+    from transformers import TrainingArguments
+
+    assert torch.cuda.is_available(), "the ZeRO-3 check requires a CUDA device"
+    initialized_before = torch.distributed.is_initialized()
+    try:
+        profile = zero3_cpu_offload_config(bucket_elements=4096)
+        profile["zero_optimization"]["stage3_param_persistence_threshold"] = 0
+        args = TrainingArguments(
+            output_dir=str(tmp_path / "zero3"),
+            deepspeed=profile,
+            max_steps=2,
+            report_to=[],
+            per_device_train_batch_size=2,
+            save_strategy="no",
+            disable_tqdm=True,
+            seed=7,
+        )
+        model, dataset = _tiny_trainer_inputs(torch)
+        trainer = create_offload_trainer(model=model, args=args, train_dataset=dataset)
+        result = trainer.train()
+        engine = trainer.model_wrapped
+        assert engine.zero_optimization_stage() == 3
+        assert result.global_step == 2 and math.isfinite(result.training_loss)
+        parameters = list(engine.module.parameters())
+        assert parameters and all(
+            parameter.ds_tensor.device.type == "cpu" for parameter in parameters
+        )
+        shards = engine.optimizer.fp32_partitioned_groups_flat
+        assert shards and all(shard.device.type == "cpu" for shard in shards)
+        print(
+            json.dumps(
+                {
+                    "device": str(trainer.args.device),
+                    "steps": result.global_step,
+                    "zero_stage": 3,
+                    "cpu_parameter_shards": len(parameters),
+                    "cpu_optimizer_shards": len(shards),
+                }
+            )
+        )
+    finally:
+        if not initialized_before and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
