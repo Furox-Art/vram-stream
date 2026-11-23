@@ -172,6 +172,21 @@ Use pinned DataLoader batches and keep their source tensors stable while a
 copy is in flight. `open_torch_batches` remains available for reusable NumPy
 inputs with an explicit cache budget.
 
+When VRAM has room for selected groups, pass those groups to
+`keep_forward_layers`. Their gathered parameters stay on the GPU between
+forward and backward, avoiding another parameter transfer. Parameter shards
+and optimizer state still live in system RAM. The retained parameters can
+increase peak VRAM usage.
+
+```python
+layers = list(model.children())
+model = offload_model(model, layers=layers, keep_forward_layers=layers[-2:], mesh=mesh)
+```
+
+Apply this to the unwrapped model before creating the optimizer. If you run
+a forward pass without backward, call `reshard()` on each retained group
+to free its gathered parameters.
+
 ## Hugging Face Trainer
 
 Install Transformers, Accelerate and a compatible DeepSpeed build for the
@@ -215,9 +230,11 @@ traffic left to GPU profiling. Results characterize this workload. Actual
 training throughput depends on the model, reuse, memory budget and device.
 
 For a real GPU check, install the checkout with its test dependencies and run
-the suite with `VRAM_STREAM_TEST_CUDA=1`. The training test compares final
-weights and losses against a GPU baseline and prints elapsed time and peak
-PyTorch VRAM allocation. `VRAM_STREAM_TEST_TRAINER=1` enables a separate
+the suite with `VRAM_STREAM_TEST_CUDA=1`. After warm-up, the training test
+measures step time and peak PyTorch VRAM for a GPU baseline, CPU offload,
+and CPU offload with the last two layer groups retained between forward and
+backward. It checks losses, final weights and parameter placement.
+`VRAM_STREAM_TEST_TRAINER=1` enables a separate
 comparison of two real Trainer runs using the same initial weights. The
 manual [Trainer validation](https://github.com/Furox-Art/vram-stream/actions/workflows/trainer-validation.yml)
 workflow runs this comparison on CPU with a synthetic dataset.
