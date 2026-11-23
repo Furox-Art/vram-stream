@@ -80,6 +80,17 @@ def test_fsdp_wraps_children_before_root(monkeypatch):
     with pytest.raises(ValueError, match="submodules"):
         offload_model(model, layers=(Module(),))
     assert len(calls) == 3
+    calls.clear()
+    with pytest.raises(ValueError, match="keep_forward_layers"):
+        offload_model(model, layers=(group,), keep_forward_layers=(child,))
+    assert not calls
+    offload_model(model, layers=(group, child), keep_forward_layers=(child,))
+    assert [module for module, _ in calls] == [child, group, model]
+    assert [options["reshard_after_forward"] for _, options in calls] == [
+        False,
+        True,
+        True,
+    ]
 
 
 def test_trainer_enters_activation_scope_only_in_training(monkeypatch):
@@ -189,30 +200,35 @@ def test_training_offload_on_cuda_hardware(tmp_path):
     )
     inputs = torch.randn(16, width, device="cuda")
     targets = torch.randn_like(inputs)
-    steps = 4
+    warmup_steps = 4
+    steps = 24
 
-    def train(network, *, activation_offload):
+    def train(network, *, activation_offload, check_forward=None):
         optimizer = torch.optim.AdamW(network.parameters(), lr=0.001, foreach=False)
-        losses = []
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        start = perf_counter()
-        for _ in range(steps):
+
+        def step(check_layout=None):
             optimizer.zero_grad(set_to_none=True)
             with offload_activations() if activation_offload else nullcontext():
                 loss = torch.nn.functional.mse_loss(network(inputs), targets)
+            if check_layout is not None:
+                check_layout()
             loss.backward()
             optimizer.step()
-            losses.append(loss.detach())
+            return loss.detach()
+
+        step(check_forward)
+        for _ in range(warmup_steps - 1):
+            step()
         torch.cuda.synchronize()
-        return (
-            torch.stack(losses).cpu(),
-            {
-                "ms_per_step": round((perf_counter() - start) * 1000 / steps, 3),
-                "peak_vram_mib": round(torch.cuda.max_memory_allocated() / 2**20, 3),
-            },
-            optimizer,
-        )
+        torch.cuda.reset_peak_memory_stats()
+        start = perf_counter()
+        losses = [step() for _ in range(steps)]
+        torch.cuda.synchronize()
+        stats = {
+            "ms_per_step": round((perf_counter() - start) * 1000 / steps, 3),
+            "peak_vram_mib": round(torch.cuda.max_memory_allocated() / 2**20, 3),
+        }
+        return torch.stack(losses).cpu(), stats, optimizer
 
     baseline = deepcopy(model).cuda()
     reference_loss, reference_stats, reference_optimizer = train(
@@ -222,6 +238,34 @@ def test_training_offload_on_cuda_hardware(tmp_path):
     del baseline, reference_optimizer
     torch.cuda.empty_cache()
 
+    def train_offloaded(mesh, *, keep_last):
+        network = deepcopy(model)
+        layers = list(network.children())
+        kept = layers[len(layers) - keep_last:]
+        offload_model(network, layers=layers, keep_forward_layers=kept, mesh=mesh)
+
+        def check_forward():
+            for layer in layers:
+                parameter = next(layer.parameters())
+                if layer in kept:
+                    assert parameter.device.type == "cuda"
+                else:
+                    assert parameter.to_local().device.type == "cpu"
+
+        loss, stats, optimizer = train(
+            network, activation_offload=True, check_forward=check_forward
+        )
+        torch.testing.assert_close(loss, reference_loss, rtol=1e-4, atol=1e-5)
+        for actual, expected in zip(network.parameters(), reference_weights, strict=True):
+            assert actual.to_local().device.type == "cpu"
+            assert actual.grad.to_local().device.type == "cpu"
+            torch.testing.assert_close(
+                actual.to_local(), expected, rtol=1e-4, atol=2e-6
+            )
+        for state in optimizer.state.values():
+            assert state["exp_avg"].to_local().device.type == "cpu"
+        return stats
+
     torch.distributed.init_process_group(
         backend="nccl",
         rank=0,
@@ -230,24 +274,18 @@ def test_training_offload_on_cuda_hardware(tmp_path):
     )
     try:
         mesh = init_device_mesh("cuda", (1,))
-        model = offload_model(model, layers=list(model.children()), mesh=mesh)
-        loss, offload_stats, optimizer = train(model, activation_offload=True)
-        torch.testing.assert_close(loss, reference_loss, rtol=1e-4, atol=1e-5)
-        for actual, expected in zip(model.parameters(), reference_weights, strict=True):
-            assert actual.to_local().device.type == "cpu"
-            assert actual.grad.to_local().device.type == "cpu"
-            torch.testing.assert_close(
-                actual.to_local(), expected, rtol=1e-4, atol=2e-6
-            )
-        for state in optimizer.state.values():
-            assert state["exp_avg"].to_local().device.type == "cpu"
+        offload_stats = train_offloaded(mesh, keep_last=0)
+        torch.cuda.empty_cache()
+        retained_stats = train_offloaded(mesh, keep_last=2)
         print(
             json.dumps(
                 {
                     "gpu": torch.cuda.get_device_name(0),
                     "steps": steps,
+                    "warmup_steps": warmup_steps,
                     "baseline": reference_stats,
                     "cpu_offload": offload_stats,
+                    "cpu_offload_keep_last_two": retained_stats,
                     "matching_training": True,
                 }
             )
