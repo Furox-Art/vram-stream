@@ -37,16 +37,25 @@ def test_zero3_profile_offloads_model_and_optimizer():
 
 def test_fsdp_wraps_children_before_root(monkeypatch):
     class Module:
-        def __init__(self, *children):
+        def __init__(self, *children, parameters=()):
             self.children = children
+            self.own_parameters = parameters
 
         def modules(self):
             yield self
             for child in self.children:
                 yield from child.modules()
 
-    child = Module()
-    group = Module(child)
+        def parameters(self, *, recurse):
+            assert not recurse
+            return iter(self.own_parameters)
+
+    trainable = SimpleNamespace(
+        numel=lambda: 5, element_size=lambda: 4, requires_grad=True
+    )
+    frozen = SimpleNamespace(numel=lambda: 6, element_size=lambda: 4, requires_grad=False)
+    child = Module(parameters=(trainable,))
+    group = Module(child, parameters=(frozen,))
     model = Module(group)
     calls = []
 
@@ -104,6 +113,25 @@ def test_fsdp_wraps_children_before_root(monkeypatch):
     assert calls[0] == (child, {"mesh": None, "reshard_after_forward": False})
     assert [module for module, _ in calls] == [child, group, model]
     assert all(options["offload_policy"] == ("cpu", True) for _, options in calls[1:])
+
+    calls.clear()
+    with pytest.raises(ValueError, match="choose resident_layers or"):
+        offload_model(
+            model,
+            layers=(group, child),
+            resident_layers=(child,),
+            resident_state_budget_bytes=80,
+        )
+    with pytest.raises(ValueError, match="resident_state_budget_bytes"):
+        offload_model(model, layers=(group, child), resident_state_budget_bytes=-1)
+    assert not calls
+
+    # Wrapping the child first leaves only the frozen tensor in the parent group.
+    for budget, resident in ((0, []), (24, [group]), (80, [child]), (104, [child, group])):
+        calls.clear()
+        offload_model(model, layers=(group, child), resident_state_budget_bytes=budget)
+        selected = [module for module, options in calls if "offload_policy" not in options]
+        assert selected == resident
 
 
 def test_trainer_enters_activation_scope_only_in_training(monkeypatch):
@@ -256,11 +284,16 @@ def test_training_offload_on_cuda_hardware(tmp_path):
         layers = list(network.children())
         kept = layers[len(layers) - keep_last :]
         resident = layers[len(layers) - resident_last :]
+        budget = sum(
+            4 * parameter.numel() * parameter.element_size()
+            for layer in resident
+            for parameter in layer.parameters()
+        )
         offload_model(
             network,
             layers=layers,
             keep_forward_layers=kept,
-            resident_layers=resident,
+            resident_state_budget_bytes=budget,
             mesh=mesh,
         )
 
