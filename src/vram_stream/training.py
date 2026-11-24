@@ -19,12 +19,42 @@ def offload_activations(*, pin_memory: bool = True):
     return _pytorch().autograd.graph.save_on_cpu(pin_memory=pin_memory)
 
 
+def _resident_groups_within_budget(layers, budget_bytes):
+    groups = []
+    covered_modules = set()
+    for layer in layers:
+        parameters = {}
+        for module in layer.modules():
+            if id(module) in covered_modules:
+                continue
+            covered_modules.add(id(module))
+            for parameter in module.parameters(recurse=False):
+                parameters[id(parameter)] = parameter
+        # AdamW adds two state tensors to the parameter and its gradient.
+        state_bytes = sum(
+            (4 if parameter.requires_grad else 1)
+            * parameter.numel()
+            * parameter.element_size()
+            for parameter in parameters.values()
+        )
+        if state_bytes:
+            groups.append((state_bytes, id(layer)))
+
+    resident = set()
+    for state_bytes, layer_id in sorted(groups, key=lambda group: group[0], reverse=True):
+        if state_bytes <= budget_bytes:
+            resident.add(layer_id)
+            budget_bytes -= state_bytes
+    return resident
+
+
 def offload_model(
     model,
     *,
     layers=(),
     keep_forward_layers=(),
     resident_layers=(),
+    resident_state_budget_bytes: int | None = None,
     mesh=None,
     pin_memory: bool = True,
 ):
@@ -33,6 +63,12 @@ def offload_model(
     Groups in ``resident_layers`` keep their parameter shards, gradients and
     optimizer state on the training device. The other groups use CPU offload.
     Select groups from ``layers`` that fit alongside the model's working memory.
+
+    A ``resident_state_budget_bytes`` budget selects those groups automatically.
+    It estimates AdamW tensor storage using four copies of each trainable
+    parameter and one copy of each frozen parameter before sharding. Groups
+    are considered by decreasing estimated size. Allow separate VRAM for
+    activations, gathered parameters, and other temporary allocations.
 
     Choose a subset of ``layers`` with ``keep_forward_layers`` to keep their
     gathered parameters in VRAM between forward and backward. This avoids
@@ -73,7 +109,15 @@ def offload_model(
         raise ValueError("resident_layers must be a subset of layers")
 
     # FSDP2 wraps child groups before their parents.
-    for layer in sorted(selected, key=lambda value: positions[id(value)], reverse=True):
+    ordered = sorted(selected, key=lambda value: positions[id(value)], reverse=True)
+    if resident_state_budget_bytes is not None:
+        budget = _integer(resident_state_budget_bytes, "resident_state_budget_bytes", 0)
+        if resident:
+            raise ValueError("choose resident_layers or resident_state_budget_bytes")
+        if budget:
+            resident = _resident_groups_within_budget(ordered, budget)
+
+    for layer in ordered:
         options = {"mesh": mesh, "reshard_after_forward": id(layer) not in kept}
         if id(layer) not in resident:
             options["offload_policy"] = offload_policy

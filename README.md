@@ -205,6 +205,23 @@ buffers. Mixed placement requires an optimizer that supports both CPU and
 GPU tensors. Use `keep_forward_layers` as well to retain gathered parameters
 between forward and backward for groups with room in VRAM.
 
+To select resident groups automatically, pass `resident_state_budget_bytes`
+in place of `resident_layers`.
+
+```python
+layers = list(model.children())
+model = offload_model(
+    model, layers=layers, resident_state_budget_bytes=64 * 2**20, mesh=mesh
+)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, foreach=False)
+```
+
+This budget estimates the resident parameter, gradient and AdamW moment
+tensors. It counts four copies of each trainable parameter and one copy of
+each frozen parameter before sharding. The largest groups that fit are
+selected first. Leave separate headroom for activations, gather and reduction
+buffers, allocator overhead and temporary optimizer allocations.
+
 ## Hugging Face Trainer
 
 Install Transformers, Accelerate and a compatible DeepSpeed build for the
@@ -251,8 +268,9 @@ For a real GPU check, install the checkout with its test dependencies and run
 the suite with `VRAM_STREAM_TEST_CUDA=1`. After warm-up, the training test
 measures step time and peak PyTorch VRAM for a GPU baseline, CPU offload,
 CPU offload with gathered parameters retained, and a mix of CPU-offloaded
-and GPU-resident groups. It checks losses, final weights and the placement
-of parameter shards, gradients and optimizer state.
+and GPU-resident groups selected by a training-state budget. It checks
+losses, final weights and the placement of parameter shards, gradients and
+optimizer state.
 `VRAM_STREAM_TEST_TRAINER=1` enables a separate
 comparison of two real Trainer runs using the same initial weights. The
 manual [Trainer validation](https://github.com/Furox-Art/vram-stream/actions/workflows/trainer-validation.yml)
