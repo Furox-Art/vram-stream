@@ -19,7 +19,12 @@ requires an NVIDIA driver and a CUDA device with mapped host memory support.
 ```bash
 git clone https://github.com/Furox-Art/vram-stream.git
 cd vram-stream
+python -m pip install vram-stream
+
+# Or from a source checkout:
 python -m pip install .
+
+[PyPI](https://pypi.org/project/vram-stream/0.4.0/)
 ```
 
 ## Verify the memory connection
