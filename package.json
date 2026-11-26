@@ -1,0 +1,22 @@
+{
+  "name": "vram-stream",
+  "version": "0.4.0",
+  "description": "CLI wrapper for the vram-stream CUDA RAM mapping and VRAM caching package",
+  "license": "MIT",
+  "bin": {
+    "vram-stream": "npm/bin/vram-stream.cjs"
+  },
+  "files": [
+    "npm/bin/vram-stream.cjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Furox-Art/vram-stream.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
